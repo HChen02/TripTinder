@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    body, html { margin:0; padding:0; width:100%; height:100%; overflow:hidden; }
+    #container { position:relative; width:100%; height:100%; display:flex; align-items:center; justify-content:center; }
+
+    .card {
+      position:absolute;
+      width:90%; max-width:350px; height:60%;
+      background: #fff;
+      border-radius:12px;
+      box-shadow:0 2px 10px rgba(0,0,0,0.2);
+      display:flex; align-items:center; justify-content:center;
+      font-size:1.2em;
+      user-select:none; touch-action:none;
+      transition: transform 0.2s ease-out, background-color 0.2s ease-out;
+      will-change: transform;
+
+      /* Image background & readability */
+      background-size: cover;
+      background-position: center;
+      background-repeat: no-repeat;
+      background-blend-mode: multiply;
+      color: #fff;
+      text-shadow: 0 0 5px rgba(0,0,0,0.7);
+    }
+  </style>
+  <title>Swipe Cities</title>
+</head>
+<body>
+  <div id="container"></div>
+  <script>
+  (async ()=>{
+    console.log("Script started.");
+    const tg = window.Telegram.WebApp;
+    tg.expand();
+    tg.MainButton.hide();
+
+    const params = new URLSearchParams(location.search);
+    const session_id = params.get('session_id');
+    if(!session_id) {
+      console.error('Configuration error: Missing session_id');
+      if (tg && tg.showAlert) tg.showAlert('Configuration error: Missing session_id');
+      return tg.close();
+    }
+
+    // Data containers
+    let cityData = {};
+    let citiesArray = [];
+    const swipesCollected = {};
+    const cityImageMap = {};
+
+    // Fetch list of cities
+    try {
+      const res = await fetch(`/api/tinder/${session_id}`);
+      if (!res.ok) throw new Error(`Server returned status ${res.status}`);
+      cityData = await res.json();
+      if (Array.isArray(cityData.cities)) {
+        citiesArray = cityData.cities;
+      } else {
+        throw new Error("Invalid 'cities' array in response");
+      }
+    } catch(e) {
+      console.error("Error fetching cities:", e);
+      if (tg && tg.showAlert) tg.showAlert(`Failed to load cities: ${e.message}`);
+      return tg.close();
+    }
+
+    // Fetch CSV to build city->image_url map
+    try {
+      const csvRes = await fetch('/cities.csv');
+      if (!csvRes.ok) throw new Error(`Status ${csvRes.status}`);
+      const csvText = await csvRes.text();
+      const lines = csvText.split('\n');
+      const headers = lines[0].split(',');
+      const cityIdx = headers.indexOf('city');
+      const imgIdx  = headers.indexOf('image_url');
+      for (let i = 1; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        let parts = [];
+        if (line.includes('"')) {
+          const startQ = line.indexOf('"');
+          const endQ   = line.lastIndexOf('"');
+          if (endQ > startQ) {
+            const imgField = line.substring(startQ+1, endQ);
+            const prefix   = line.substring(0, startQ);
+            let suffix     = line.substring(endQ+1);
+            if (suffix.startsWith(',')) suffix = suffix.substring(1);
+            const preParts = prefix ? prefix.split(',') : [];
+            const sufParts = suffix ? suffix.split(',') : [];
+            parts = [...preParts, imgField, ...sufParts];
+          } else {
+            parts = line.split(',');
+          }
+        } else {
+          parts = line.split(',');
+        }
+        const cityName = (parts[cityIdx] || '').replace(/^"|"$/g, '').toLowerCase();
+        const url      = (parts[imgIdx]  || '').replace(/^"|"$/g, '');
+        if (cityName) cityImageMap[cityName] = url;
+      }
+      console.log("Loaded city images for", Object.keys(cityImageMap).length, "cities");
+    } catch(e) {
+      console.error("Error loading city images:", e);
+      // Continue without images
+    }
+
+    const container = document.getElementById('container');
+    let idx = 0;
+
+    function makeCard(text) {
+      const c = document.createElement('div');
+      c.className = 'card';
+      c.textContent = text;
+      return c;
+    }
+
+    function sendData(payload) {
+      try {
+        tg.sendData(JSON.stringify(payload));
+      } catch (e) {
+        console.error("Error sending data:", e);
+        if (tg && tg.showAlert) tg.showAlert("Error sending your choice data.");
+      }
+    }
+
+    async function showNext() {
+      if (idx >= citiesArray.length) {
+        sendData({ session_id, complete: true, swipes: swipesCollected });
+        return tg.close();
+      }
+
+      const city = citiesArray[idx++];
+      const card = makeCard(city);
+
+      // Apply background image or fallback color
+      const img = cityImageMap[city.toLowerCase()];
+      if (img) {
+        card.style.backgroundImage = `url('${img}')`;
+      } else {
+        card.style.backgroundColor = '#444';
+      }
+
+      container.appendChild(card);
+
+      let startX = 0, curX = 0;
+      let handlerCalled = false;
+      let fallbackTimeout = null;
+
+      function update() {
+        const dx = curX - startX;
+        card.style.transform = `translateX(${dx}px) rotate(${dx/10}deg)`;
+        const swipeThreshold = 200;
+        const norm = Math.min(Math.max((dx/swipeThreshold)+0.5,0),1);
+        const r = Math.round(255*(1-norm));
+        const g = Math.round(255*norm);
+        const opacity = Math.min(Math.abs(dx)/(swipeThreshold*0.75),1);
+        card.style.backgroundColor = `rgba(${r},${g},100,${opacity})`;
+      }
+
+      const performCleanupAndShowNext = (isSwipe, swCity, choice) => {
+        if (handlerCalled) return;
+        handlerCalled = true;
+        clearTimeout(fallbackTimeout);
+        card.removeEventListener('transitionend', onTransitionEnd);
+
+        if (isSwipe) {
+          swipesCollected[swCity] = choice;
+          card.remove();
+        } else {
+          card.style.transition = 'none';
+          card.style.transform  = 'translateX(0) rotate(0)';
+          card.style.backgroundColor = 'rgba(255,255,255,0)';
+          startX = curX = 0;
+        }
+        showNext();
+      };
+
+      const onTransitionEnd = (e) => {
+        performCleanupAndShowNext(onTransitionEnd.isSwipe, onTransitionEnd.city, onTransitionEnd.choice);
+      };
+
+      card.addEventListener('pointerdown', e => {
+        startX = e.clientX;
+        card.setPointerCapture(e.pointerId);
+        card.style.transition = 'none';
+      });
+
+      card.addEventListener('pointermove', e => {
+        if (card.hasPointerCapture(e.pointerId)) {
+          curX = e.clientX;
+          update();
+        }
+      });
+
+      card.addEventListener('pointerup', e => {
+        card.releasePointerCapture(e.pointerId);
+        card.style.transition = 'transform 0.2s ease-out, background-color 0.2s ease-out';
+        const dx = curX - startX;
+        const isSwipe = Math.abs(dx) > 100;
+        const choice = isSwipe ? (dx>0?'yes':'no') : null;
+        onTransitionEnd.isSwipe = isSwipe;
+        onTransitionEnd.city    = city;
+        onTransitionEnd.choice  = choice;
+        card.addEventListener('transitionend', onTransitionEnd);
+        fallbackTimeout = setTimeout(() => performCleanupAndShowNext(isSwipe, city, choice), 300);
+
+        if (isSwipe) {
+          const targetX = dx > 0 ? window.innerWidth*1.5 : -window.innerWidth*1.5;
+          card.style.transform = `translateX(${targetX}px) rotate(${dx/8}deg)`;
+          card.style.opacity = 0;
+        } else {
+          card.style.transform = 'translateX(0) rotate(0)';
+          card.style.backgroundColor = 'rgba(255,255,255,0)';
+        }
+      });
+
+      card.addEventListener('pointercancel', e => {
+        if (card.hasPointerCapture(e.pointerId)) card.releasePointerCapture(e.pointerId);
+        card.style.transition = 'transform 0.2s ease-out, background-color 0.2s ease-out';
+        onTransitionEnd.isSwipe = false;
+        onTransitionEnd.city    = city;
+        onTransitionEnd.choice  = null;
+        card.addEventListener('transitionend', onTransitionEnd);
+        fallbackTimeout = setTimeout(() => performCleanupAndShowNext(false, city, null), 300);
+        card.style.transform = 'translateX(0) rotate(0)';
+        card.style.backgroundColor = 'rgba(255,255,255,0)';
+      });
+    }
+
+    if (citiesArray.length > 0) showNext();
+    else {
+      sendData({ session_id, complete: true, swipes: {} });
+      tg.close();
+    }
+  })();
+  </script>
+</body>
+</html>
